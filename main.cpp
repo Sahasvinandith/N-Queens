@@ -40,6 +40,7 @@ public:
 private:
     // --- OPTIMIZED COUNTING (Low Memory) ---
     void solve_count() {
+        // Parallel region
         #pragma omp parallel reduction(+:total_count)
         {
             #pragma omp for schedule(dynamic)
@@ -47,7 +48,6 @@ private:
                 int cols = (1 << col);
                 int ld = (1 << col) << 1;
                 int rd = (1 << col) >> 1;
-                // No vector allocation here, just pure math recursion
                 total_count += backtrack_count(1, ld, cols, rd);
             }
         }
@@ -86,7 +86,6 @@ private:
                 backtrack_store(1, ld, cols, rd, current_path, local_solutions);
             }
 
-            // Only merge if we actually found something
             if (!local_solutions.empty()) {
                 #pragma omp critical
                 {
@@ -148,11 +147,17 @@ int main(int argc, char* argv[]) {
         current_mode = COUNT_ONLY; // N=17+ (Prevents RAM crash)
     }
 
+    // --- 3. DETECT THREADS ---
+    // OpenMP environment might be set by OMP_NUM_THREADS env var.
+    // If not set, it defaults to number of logical cores.
+    int num_threads = omp_get_max_threads();
+
     std::string modeStr = (current_mode == STORE_ALL) ? "Store All" : "Count Only (High Performance)";
     std::cout << "--- N-Queens Solver (N=" << n << ") ---" << std::endl;
-    std::cout << "Mode: " << modeStr << std::endl;
+    std::cout << "Mode   : " << modeStr << std::endl;
+    std::cout << "Threads: " << num_threads << " active" << std::endl;
 
-    // --- 3. CALCULATION ---
+    // --- 4. CALCULATION ---
     auto start_calc = std::chrono::high_resolution_clock::now();
 
     NQueens solver(n, current_mode);
@@ -163,18 +168,17 @@ int main(int argc, char* argv[]) {
     auto end_calc = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration_calc = end_calc - start_calc;
 
-    // --- 4. OUTPUT ---
+    // --- 5. OUTPUT ---
     std::string output_file = std::string(argv[1]).substr(0, std::string(argv[1]).find_last_of(".")) + "_output.txt";
     auto start_io = std::chrono::high_resolution_clock::now();
 
     std::ofstream outfile(output_file);
-    if (count == 0 && n > 3) { // n=2,3 have 0 solutions
+    if (count == 0 && n > 3) { 
          outfile << "No Solution";
     } else {
         outfile << n << "\n";
         outfile << count << "\n";
         
-        // Only write boards if we actually stored them
         if (current_mode == STORE_ALL) {
             for (size_t i = 0; i < solutions_data.size(); ++i) {
                 const auto& sol = solutions_data[i];
@@ -190,7 +194,7 @@ int main(int argc, char* argv[]) {
     auto end_io = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration_io = end_io - start_io;
 
-    // --- 5. STATS ---
+    // --- 6. STATS ---
     std::cout << "-----------------------------------" << std::endl;
     std::cout << "Solutions Found : " << count << std::endl;
     std::cout << "Calculation Time: " << std::fixed << std::setprecision(6) << duration_calc.count() << " s" << std::endl;
