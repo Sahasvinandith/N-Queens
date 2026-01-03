@@ -5,205 +5,194 @@
 #include <algorithm>
 #include <chrono>
 #include <omp.h>
+#include <sstream>
 #include <iomanip>
 
-// Strategy Enum
-enum Mode {
-    FIND_FIRST,  // Stop after 1 solution (Fastest check)
-    STORE_ALL,   // Save and print all boards (RAM heavy, limit N<=16)
-    COUNT_ONLY   // Count total solutions (RAM safe, fast for N=17+)
-};
+// --- TUNING PARAMETERS ---
+// How many solutions a thread holds in RAM before writing to disk.
+// 2048 is a sweet spot: Large enough to reduce lock contention, small enough to save RAM.
+const int BATCH_SIZE = 2048; 
 
-class NQueens {
+using namespace std;
+
+class OptimizedNQueens {
     int n;
     int limit_mask;
-    Mode mode;
-    std::vector<std::vector<int>> stored_solutions;
-    unsigned long long total_count = 0;
-    volatile bool found_one = false;
+    unsigned long long total_solutions = 0;
+    ofstream& outFile;
+    
+    // Timer for calculation vs I/O tracking (approximate)
+    double time_io_wait = 0.0;
 
 public:
-    NQueens(int size, Mode m) : n(size), mode(m) {
+    OptimizedNQueens(int size, ofstream& out) : n(size), outFile(out) {
         limit_mask = (1 << n) - 1;
     }
 
-    // Returns pair: {count, reference_to_solutions}
-    std::pair<unsigned long long, const std::vector<std::vector<int>>&> solve() {
-        if (mode == COUNT_ONLY) {
-            solve_count();
-        } else {
-            solve_store();
+    void solve() {
+        // Start parallel region
+        #pragma omp parallel
+        {
+            // --- THREAD LOCAL STORAGE ---
+            // Each thread gets its own private "notepad" (stringstream).
+            // This prevents threads from fighting over memory.
+            stringstream local_buffer;
+            int buffer_count = 0; 
+            vector<int> path(n); // Stores current board state
+
+            // --- DYNAMIC SCHEDULING ---
+            // 'dynamic' ensures that if one thread finishes a hard branch,
+            // it immediately grabs a new chunk of work. No core sits idle.
+            #pragma omp for schedule(dynamic) reduction(+:total_solutions)
+            for (int col = 0; col < n; ++col) {
+                path[0] = col;
+                
+                // Start recursive solver for this column's branch
+                backtrack(1, (1 << col) << 1, (1 << col), (1 << col) >> 1, 
+                          path, local_buffer, buffer_count);
+            }
+
+            // --- FINAL FLUSH ---
+            // Write any remaining solutions currently in the buffer
+            if (buffer_count > 0) {
+                flush_buffer(local_buffer);
+            }
         }
-        return {total_count, stored_solutions};
     }
 
 private:
-    // --- OPTIMIZED COUNTING (Low Memory) ---
-    void solve_count() {
-        // Parallel region
-        #pragma omp parallel reduction(+:total_count)
-        {
-            #pragma omp for schedule(dynamic)
-            for (int col = 0; col < n; ++col) {
-                int cols = (1 << col);
-                int ld = (1 << col) << 1;
-                int rd = (1 << col) >> 1;
-                total_count += backtrack_count(1, ld, cols, rd);
-            }
-        }
-    }
-
-    unsigned long long backtrack_count(int row, int ld, int cols, int rd) {
-        if (row == n) return 1;
-
-        int possible = ~(ld | cols | rd) & limit_mask;
-        unsigned long long local_sum = 0;
-
-        while (possible) {
-            int bit = possible & -possible;
-            possible -= bit;
-            local_sum += backtrack_count(row + 1, (ld | bit) << 1, (cols | bit), (rd | bit) >> 1);
-        }
-        return local_sum;
-    }
-
-    // --- STORING SOLUTIONS (High Memory) ---
-    void solve_store() {
-        #pragma omp parallel
-        {
-            std::vector<std::vector<int>> local_solutions;
-            std::vector<int> current_path(n);
-
-            #pragma omp for schedule(dynamic)
-            for (int col = 0; col < n; ++col) {
-                if (mode == FIND_FIRST && found_one) continue;
-
-                int cols = (1 << col);
-                int ld = (1 << col) << 1;
-                int rd = (1 << col) >> 1;
-
-                current_path[0] = col;
-                backtrack_store(1, ld, cols, rd, current_path, local_solutions);
-            }
-
-            if (!local_solutions.empty()) {
-                #pragma omp critical
-                {
-                    stored_solutions.insert(stored_solutions.end(), local_solutions.begin(), local_solutions.end());
-                    total_count += local_solutions.size();
-                }
-            }
-        }
-    }
-
-    void backtrack_store(int row, int ld, int cols, int rd, 
-                         std::vector<int>& path, 
-                         std::vector<std::vector<int>>& local_sols) {
+    // Helper to write buffer to disk safely
+    void flush_buffer(stringstream& buffer) {
+        // We time how long we wait for the disk
+        double start = omp_get_wtime();
         
-        if (mode == FIND_FIRST && found_one) return;
+        // CRITICAL SECTION: Only one thread can write to the file at a time.
+        // Because we buffer 2048 solutions, we enter this section 2048x LESS often.
+        #pragma omp critical(disk_write)
+        {
+            outFile << buffer.rdbuf();
+        }
+        
+        // Clear the buffer for reuse
+        buffer.str(""); 
+        buffer.clear();
 
+        // Track stats
+        double end = omp_get_wtime();
+        #pragma omp atomic
+        time_io_wait += (end - start);
+    }
+
+    // Core Bitwise Backtracking
+    void backtrack(int row, int ld, int cols, int rd, 
+                   vector<int>& path, 
+                   stringstream& buffer, 
+                   int& count) {
+        
         if (row == n) {
-            local_sols.push_back(path);
-            if (mode == FIND_FIRST) found_one = true;
+            // 1. Format solution into local RAM buffer
+            for (int i = 0; i < n; ++i) {
+                buffer << (path[i] + 1) << (i == n - 1 ? "" : " ");
+            }
+            buffer << "\n";
+            count++;
+
+            // 2. Check if buffer is full
+            if (count >= BATCH_SIZE) {
+                flush_buffer(buffer);
+                count = 0;
+            }
             return;
         }
 
+        // Bitwise magic to find safe spots
         int possible = ~(ld | cols | rd) & limit_mask;
 
         while (possible) {
-            int bit = possible & -possible;
-            possible -= bit;
-            int col_idx = __builtin_ctz(bit); 
-            path[row] = col_idx;
-
-            backtrack_store(row + 1, (ld | bit) << 1, (cols | bit), (rd | bit) >> 1, path, local_sols);
+            int bit = possible & -possible; // Extract lowest bit (rightmost safe column)
+            possible -= bit;                // Remove it from 'possible' set
             
-            if (mode == FIND_FIRST && found_one) return; 
+            path[row] = __builtin_ctz(bit); // Convert bit to index (0-based) for printing
+
+            // Recursive call: Shift diagonals for next row
+            backtrack(row + 1, (ld | bit) << 1, (cols | bit), (rd | bit) >> 1, 
+                      path, buffer, count);
         }
     }
+    
+public:
+    double get_io_overhead() { return time_io_wait; }
+    unsigned long long get_total() { return total_solutions; }
 };
 
-int main(int argc, char* argv[]) {
-    // --- 1. SETUP ---
-    if (argc < 2) {
-        std::cerr << "Usage: ./nqueens_solver <input_file>" << std::endl;
+int main(int argc, char** argv) {
+    // Optimizes C++ standard streams
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    if (argc != 2) {
+        cerr << "Usage: ./nqueens_final <input_file>\n";
         return 1;
     }
 
-    int n = 0;
-    std::ifstream infile(argv[1]);
-    if (infile >> n) {
-        infile.close();
-    } else {
-        std::cerr << "Error reading input file." << std::endl;
-        return 1;
-    }
+    // 1. Read Input
+    string inputPath = argv[1];
+    ifstream in(inputPath);
+    if (!in) { cerr << "Error opening input file.\n"; return 1; }
+    int n;
+    in >> n;
+    in.close();
 
-    // --- 2. SELECT MODE ---
-    Mode current_mode;
-    if (n <= 16) {
-        current_mode = STORE_ALL; // Safe to store in RAM
-    } else {
-        current_mode = COUNT_ONLY; // N=17+ (Prevents RAM crash)
-    }
+    // 2. Prepare Output
+    string outputPath = inputPath.substr(0, inputPath.find_last_of('.')) + "_output.txt";
+    ofstream outFile(outputPath);
+    if (!outFile) { cerr << "Error creating output file.\n"; return 1; }
 
-    // --- 3. DETECT THREADS ---
-    // OpenMP environment might be set by OMP_NUM_THREADS env var.
-    // If not set, it defaults to number of logical cores.
-    int num_threads = omp_get_max_threads();
+    // --- HEADER PATCHING TRICK ---
+    // We write N, then leave a blank space for the Total Count.
+    // We will come back and fill this in later.
+    outFile << n << "\n";
+    long count_position = outFile.tellp(); // Remember this position
+    outFile << string(20, ' ') << "\n";    // Reserve 20 spaces (enough for 64-bit int)
 
-    std::string modeStr = (current_mode == STORE_ALL) ? "Store All" : "Count Only (High Performance)";
-    std::cout << "--- N-Queens Solver (N=" << n << ") ---" << std::endl;
-    std::cout << "Mode   : " << modeStr << std::endl;
-    std::cout << "Threads: " << num_threads << " active" << std::endl;
+    // 3. Print Stats to Console
+    cout << "===========================================\n";
+    cout << "   N-QUEENS OPTIMIZED SOLVER (N=" << n << ")\n";
+    cout << "===========================================\n";
+    cout << "CPU Threads      : " << omp_get_max_threads() << "\n";
+    cout << "Batch Buffer Size: " << BATCH_SIZE << " solutions\n";
+    cout << "Output Strategy  : Streamed (Low RAM usage)\n";
+    cout << "-------------------------------------------\n";
+    cout << "Solving... (This may take time for large N)\n";
 
-    // --- 4. CALCULATION ---
-    auto start_calc = std::chrono::high_resolution_clock::now();
+    // 4. Run Solver
+    auto start_time = chrono::high_resolution_clock::now();
 
-    NQueens solver(n, current_mode);
-    auto result = solver.solve();
-    unsigned long long count = result.first;
-    const auto& solutions_data = result.second;
+    OptimizedNQueens solver(n, outFile);
+    solver.solve();
 
-    auto end_calc = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> duration_calc = end_calc - start_calc;
+    auto end_time = chrono::high_resolution_clock::now();
+    double total_seconds = chrono::duration<double>(end_time - start_time).count();
 
-    // --- 5. OUTPUT ---
-    std::string output_file = std::string(argv[1]).substr(0, std::string(argv[1]).find_last_of(".")) + "_output.txt";
-    auto start_io = std::chrono::high_resolution_clock::now();
+    // 5. Finalize File (The "Rewind")
+    unsigned long long total = solver.get_total();
+    outFile.seekp(count_position); // Jump back to line 2
+    outFile << total;              // Overwrite the spaces with the real number
+    outFile.close();
 
-    std::ofstream outfile(output_file);
-    if (count == 0 && n > 3) { 
-         outfile << "No Solution";
-    } else {
-        outfile << n << "\n";
-        outfile << count << "\n";
-        
-        if (current_mode == STORE_ALL) {
-            for (size_t i = 0; i < solutions_data.size(); ++i) {
-                const auto& sol = solutions_data[i];
-                for (size_t r = 0; r < sol.size(); ++r) {
-                    outfile << (sol[r] + 1) << (r == n - 1 ? "" : " ");
-                }
-                outfile << "\n";
-            }
-        }
-    }
-    outfile.close();
-
-    auto end_io = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> duration_io = end_io - start_io;
-
-    // --- 6. STATS ---
-    std::cout << "-----------------------------------" << std::endl;
-    std::cout << "Solutions Found : " << count << std::endl;
-    std::cout << "Calculation Time: " << std::fixed << std::setprecision(6) << duration_calc.count() << " s" << std::endl;
-    if (current_mode == COUNT_ONLY) {
-         std::cout << "Note: Solutions were counted but NOT written to file (too large)." << std::endl;
-    } else {
-         std::cout << "File Write Time : " << duration_io.count() << " s" << std::endl;
-    }
-    std::cout << "-----------------------------------" << std::endl;
+    // 6. Final Report
+    double io_overhead = solver.get_io_overhead(); // Total CPU time spent waiting for lock
+    // Note: IO overhead is summed across threads, so it can be > wall time.
+    // We normalize it by thread count for an estimate, or just show raw.
+    
+    cout << "-------------------------------------------\n";
+    cout << "Processing Complete!\n";
+    cout << "-------------------------------------------\n";
+    cout << "Total Solutions  : " << total << "\n";
+    cout << "Total Time       : " << fixed << setprecision(4) << total_seconds << " s\n";
+    cout << "Approx Throughput: " << (total / total_seconds) << " solutions/sec\n";
+    cout << "Output File      : " << outputPath << "\n";
+    cout << "===========================================\n";
 
     return 0;
 }
