@@ -19,24 +19,24 @@ class OptimizedNQueens {
     int n;
     int limit_mask;
     unsigned long long total_solutions = 0;
-    ofstream* outFile; // Pointer allows us to pass "nullptr" to disable writing
-    double time_io_wait = 0.0;
+    ofstream* outFile; 
+    double time_io_wait = 0.0; // Tracks time spent waiting for disk
     bool write_to_disk;
 
 public:
-    // If "out" is nullptr, we run in Count-Only mode
     OptimizedNQueens(int size, ofstream* out) : n(size), outFile(out) {
         limit_mask = (1 << n) - 1;
         write_to_disk = (outFile != nullptr);
     }
 
     void solve() {
-        unsigned long long global_count_accumulator = 0;
+        unsigned long long global_count = 0;
 
-        #pragma omp parallel reduction(+:global_count_accumulator)
+        // Parallel Region
+        #pragma omp parallel reduction(+:global_count)
         {
             stringstream local_buffer;
-            int buffer_fill_level = 0; 
+            int buffer_fill = 0; 
             vector<int> path(n);
 
             #pragma omp for schedule(dynamic)
@@ -45,32 +45,37 @@ public:
                 unsigned long long branch_count = 0;
                 
                 backtrack(1, (1 << col) << 1, (1 << col), (1 << col) >> 1, 
-                          path, local_buffer, buffer_fill_level, branch_count);
+                          path, local_buffer, buffer_fill, branch_count);
                 
-                global_count_accumulator += branch_count;
+                global_count += branch_count;
             }
 
-            // Flush remaining buffer (Only if writing is enabled)
-            if (write_to_disk && buffer_fill_level > 0) {
+            // Flush remaining buffer
+            if (write_to_disk && buffer_fill > 0) {
                 flush_buffer(local_buffer);
             }
         }
-        total_solutions = global_count_accumulator;
+        total_solutions = global_count;
     }
 
 private:
     void flush_buffer(stringstream& buffer) {
-        if (!write_to_disk) return; // Double check
+        if (!write_to_disk) return;
 
         double start = omp_get_wtime();
+        
+        // Critical Section: Write to disk
         #pragma omp critical(disk_write)
         {
             (*outFile) << buffer.rdbuf();
         }
-        buffer.str(""); 
-        buffer.clear();
+        
         double end = omp_get_wtime();
         
+        buffer.str(""); 
+        buffer.clear();
+        
+        // Track the overhead
         #pragma omp atomic
         time_io_wait += (end - start);
     }
@@ -83,10 +88,7 @@ private:
         
         if (row == n) {
             branch_total++;
-
-            // OPTIMIZATION: If we are not writing to disk, return immediately!
-            // This makes N>17 runs extremely fast.
-            if (!write_to_disk) return;
+            if (!write_to_disk) return; // Optimization: Skip formatting if Safe Mode
 
             for (int i = 0; i < n; ++i) {
                 buffer << (path[i] + 1) << (i == n - 1 ? "" : " ");
@@ -132,43 +134,37 @@ int main(int argc, char** argv) {
     in >> n;
     in.close();
 
-    // --- SAFETY CHECKS ---
     if (n > HARD_LIMIT_N) {
-        cerr << "ERROR: N=" << n << " is too large for this solver (Limit: " << HARD_LIMIT_N << "). Exiting.\n";
+        cerr << "Error: N=" << n << " exceeds hard limit (" << HARD_LIMIT_N << ").\n";
         return 1;
     }
 
-    // Determine Mode
     bool safe_to_write = (n <= MAX_WRITE_N);
     string outputPath = inputPath.substr(0, inputPath.find_last_of('.')) + "_output.txt";
     
-    // We strictly control the ofstream here
     ofstream* filePtr = nullptr;
     ofstream outFile;
 
     if (safe_to_write) {
         outFile.open(outputPath);
         if (!outFile) { cerr << "Error creating output file.\n"; return 1; }
-        
-        // Header Placeholder Trick
         outFile << n << "\n";
-        outFile << string(20, ' ') << "\n"; 
+        outFile << string(20, ' ') << "\n"; // Header placeholder
         filePtr = &outFile;
     }
 
     // --- DASHBOARD ---
     cout << "===========================================\n";
-    cout << "   N-QUEENS SAFETY SOLVER (N=" << n << ")\n";
+    cout << "   N-QUEENS FINAL SOLVER (N=" << n << ")\n";
     cout << "===========================================\n";
     cout << "CPU Threads      : " << omp_get_max_threads() << "\n";
-    cout << "Mode             : " << (safe_to_write ? "FULL WRITE (Solutions + Count)" : "COUNT ONLY (Disk Safety Active)") << "\n";
+    cout << "Write Mode       : " << (safe_to_write ? "Full Output" : "Count Only (Safe Mode)") << "\n";
     if (safe_to_write) cout << "Batch Buffer     : " << BATCH_SIZE << " solutions\n";
     cout << "-------------------------------------------\n";
     cout << "Solving...\n";
 
     auto start_time = chrono::high_resolution_clock::now();
 
-    // Pass "nullptr" if we shouldn't write, automatically disabling I/O logic
     OptimizedNQueens solver(n, filePtr);
     solver.solve();
 
@@ -176,29 +172,36 @@ int main(int argc, char** argv) {
     double total_seconds = chrono::duration<double>(end_time - start_time).count();
     unsigned long long total = solver.get_total();
 
-    // --- FINALIZE OUTPUT ---
+    // Fix Header
     if (safe_to_write) {
-        outFile.seekp(to_string(n).length() + 1); // Jump to line 2 (after N + newline)
+        outFile.seekp(to_string(n).length() + 1);
         outFile << total;
         outFile.close();
     } else {
-        // For unsafe N, we might still want to save just the number to a file
-        ofstream summaryFile(outputPath);
-        summaryFile << "N=" << n << "\n";
-        summaryFile << "Total=" << total << "\n";
-        summaryFile << "(Board output suppressed due to size safety limit > " << MAX_WRITE_N << ")\n";
-        summaryFile.close();
+        ofstream summary(outputPath);
+        summary << "N=" << n << "\nTotal=" << total << "\n(Output suppressed for safety)\n";
+        summary.close();
     }
 
+    // --- FINAL REPORT ---
+    double io_time = solver.get_io_overhead();
+    // Estimate IO overhead per thread (averaged) or total CPU time spent waiting
+    // Since it's atomic sum across threads, this is "Total CPU-Seconds spent waiting"
+    
     cout << "-------------------------------------------\n";
     cout << "Processing Complete!\n";
     cout << "-------------------------------------------\n";
     cout << "Total Solutions  : " << total << "\n";
-    cout << "Total Time       : " << fixed << setprecision(4) << total_seconds << " s\n";
+    cout << "Total Wall Time  : " << fixed << setprecision(4) << total_seconds << " s\n";
+    
+    if (safe_to_write) {
+        cout << "Disk Write Overhead: " << io_time << " cpu-seconds (approx)\n";
+    }
+    
     if (total_seconds > 0)
-        cout << "Approx Throughput: " << (unsigned long long)(total / total_seconds) << " solutions/sec\n";
+        cout << "Throughput       : " << (unsigned long long)(total / total_seconds) << " solutions/sec\n";
+    
     cout << "Output File      : " << outputPath << "\n";
-    if (!safe_to_write) cout << "(Note: Output file contains COUNT ONLY to save disk space)\n";
     cout << "===========================================\n";
 
     return 0;
